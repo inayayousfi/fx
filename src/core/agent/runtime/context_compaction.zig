@@ -405,7 +405,14 @@ const SummaryCall = struct {
     /// Bytes produced when they exceeded the capture limit; `text` then holds the
     /// captured prefix up to its last complete line.
     truncated_bytes: ?usize = null,
+    /// The model stopped at its output-token limit; `text` holds its complete lines.
+    cut_at_output_limit: bool = false,
 };
+
+/// What a call does when the model stops at its output-token limit.
+const OutputLimit = enum { reject, keep_complete_lines };
+
+const output_limit_marker = "[summary cut off at the model's output limit; later details may be missing]";
 
 fn runSummaryCall(
     alloc: Allocator,
@@ -414,7 +421,7 @@ fn runSummaryCall(
     max_bytes: usize,
 ) !SummaryCall {
     const system = if (request.policy == .assistant_first) compaction_policy.instructions else summarySystemPrompt();
-    const call = try runTextCall(alloc, request, system, &.{ source_text, summary_task_reminder }, max_bytes);
+    const call = try runTextCall(alloc, request, system, &.{ source_text, summary_task_reminder }, max_bytes, .reject);
     if (call.truncated_bytes) |observed| {
         alloc.free(call.text);
         diagnostics.traceCompactionFailure(
@@ -430,7 +437,8 @@ fn runSummaryCall(
 
 /// Assistant-first summary call that states its numeric size target. The output-token
 /// limit stays at the model's normal value because some providers count reasoning
-/// toward it.
+/// toward it. A summary cut off at that limit keeps its complete lines and a visible
+/// marker, then goes through the same fitting as an overlong one.
 fn runTargetedSummaryCall(
     alloc: Allocator,
     request: Request,
@@ -440,15 +448,21 @@ fn runTargetedSummaryCall(
 ) !SummaryCall {
     var buffer: [24]u8 = undefined;
     const target = std.fmt.bufPrint(&buffer, "{d}", .{target_tokens}) catch unreachable;
-    const call = try runTextCall(alloc, request, compaction_policy.instructions, &.{
+    var call = try runTextCall(alloc, request, compaction_policy.instructions, &.{
         source_text,
         summary_task_reminder_head,
         summary_target_open,
         target,
         summary_target_close,
         summary_task_reminder_tail,
-    }, max_bytes);
+    }, max_bytes, .keep_complete_lines);
     traceKeptPrefix(request, call, max_bytes);
+    if (call.cut_at_output_limit) {
+        diagnostics.traceCompactionEvent(request.trace_ctx, .summary_incomplete, "model={s} finish_reason=length kept_bytes={d}", .{ request.model, call.text.len });
+        const marked = try std.mem.concat(alloc, u8, &.{ call.text, "\n", output_limit_marker });
+        alloc.free(call.text);
+        call.text = marked;
+    }
     return call;
 }
 
@@ -468,7 +482,7 @@ fn runShorteningCall(
         shorten_target_open,
         target,
         shorten_target_close,
-    }, max_bytes);
+    }, max_bytes, .reject);
     traceKeptPrefix(request, call, max_bytes);
     return call;
 }
@@ -498,6 +512,7 @@ fn runTextCall(
     system: []const u8,
     parts: []const []const u8,
     max_bytes: usize,
+    output_limit: OutputLimit,
 ) !SummaryCall {
     const instructions = [_]types.ChatMessage{.{
         .role = .system,
@@ -581,7 +596,8 @@ fn runTextCall(
             .input_tokens = completion.usage.input_tokens orelse 0,
             .output_tokens = completion.usage.output_tokens orelse 0,
         });
-        if (completion.finish_reason != .stop) {
+        const cut = completion.finish_reason == .length and output_limit == .keep_complete_lines;
+        if (completion.finish_reason != .stop and !cut) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
                 .summary_incomplete,
@@ -604,7 +620,7 @@ fn runTextCall(
             return error.CompactionToolCallRejected;
         }
         const truncated = capture.observed_bytes > capture.text.items.len;
-        const trimmed = std.mem.trim(u8, if (truncated) completeLines(capture.text.items) else capture.text.items, " \t\r\n");
+        const trimmed = std.mem.trim(u8, if (truncated or cut) completeLines(capture.text.items) else capture.text.items, " \t\r\n");
         if (!std.unicode.utf8ValidateSlice(trimmed)) {
             diagnostics.traceCompactionFailure(
                 request.trace_ctx,
@@ -614,11 +630,21 @@ fn runTextCall(
             );
             return error.InvalidCompactionHandoff;
         }
+        if (trimmed.len == 0 and cut) {
+            // Reasoning used the whole output limit; there is no summary text to keep.
+            diagnostics.traceCompactionFailure(
+                request.trace_ctx,
+                .summary_incomplete,
+                "model={s} attempt={d} finish_reason=length content_bytes={d}",
+                .{ request.model, attempt, capture.text.items.len },
+            );
+            return error.IncompleteCompactionHandoff;
+        }
         if (trimmed.len == 0 and !truncated) {
             if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, .empty_summary_retry, "attempt=2 model={s}", .{request.model});
             continue;
         }
-        return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage, .truncated_bytes = if (truncated) capture.observed_bytes else null };
+        return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage, .truncated_bytes = if (truncated) capture.observed_bytes else null, .cut_at_output_limit = cut };
     }
     diagnostics.traceCompactionFailure(request.trace_ctx, .summary_empty_exhausted, "model={s}", .{request.model});
     return error.InvalidCompactionHandoff;
@@ -1124,6 +1150,61 @@ test "summary task follows unchanged history for both policies and empty retries
             try std.testing.expectEqualStrings(response, result.text);
         }
     }
+}
+
+test "assistant first compaction keeps a summary cut off at the output limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const source = [_]types.ChatMessage{
+        .{ .role = .user, .context_origin = .user_turn, .content = "Keep the codename heron." },
+        .{ .role = .assistant, .content = "Noted." },
+    };
+    const cut_summary = "Standing rules and constraints:\n- Codename heron.\nWork done:\n- Half of a sente";
+    for ([_]@FieldType(Request, "policy"){ .assistant_first, .legacy }) |policy| {
+        var provider = FakeProvider{ .response = cut_summary, .finish_reason = .length };
+        var cancel = std.atomic.Value(bool).init(false);
+        const request: Request = .{
+            .stream_provider = provider.provider(),
+            .model = "fixture/model",
+            .api_key = "fixture-key",
+            .retry_count = 0,
+            .cancel_flag = &cancel,
+            .accepted_tokens = 4_096,
+            .compactor_input_tokens = 1_000_000,
+            .policy = policy,
+            .result_storage = if (policy == .assistant_first) .{ .legacy_dir = dir } else .unavailable,
+            .trace_ctx = .{},
+        };
+        if (policy == .legacy) {
+            try std.testing.expectError(error.IncompleteCompactionHandoff, compact(alloc, &source, request));
+            continue;
+        }
+        var result = try compact(alloc, &source, request);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), provider.request_count);
+        try std.testing.expect(std.mem.find(u8, result.handoff, "> - Codename heron.\n> Work done:\n> " ++ output_limit_marker ++ "\n") != null);
+        try std.testing.expect(std.mem.find(u8, result.handoff, "Half of a sente") == null);
+        try runtime_prompt_context.validateCompactionHandoff(result.handoff, 4_096);
+    }
+    // Reasoning that used the whole limit leaves nothing to keep.
+    var empty = FakeProvider{ .response = "", .finish_reason = .length };
+    var cancel = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(error.IncompleteCompactionHandoff, compact(alloc, &source, .{
+        .stream_provider = empty.provider(),
+        .model = "fixture/model",
+        .api_key = "fixture-key",
+        .retry_count = 0,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 4_096,
+        .compactor_input_tokens = 1_000_000,
+        .policy = .assistant_first,
+        .result_storage = .{ .legacy_dir = dir },
+        .trace_ctx = .{},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), empty.request_count);
 }
 
 test "summary task fits the existing prompt reservation" {
