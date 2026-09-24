@@ -110,3 +110,91 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     else { writeFileSync(join(root, "requests.json"), JSON.stringify(bodies, null, 2)); console.error(`compaction evidence retained: ${root}`); }
   }
 }, 90_000);
+
+for (const shortenedFits of [true, false]) test(`automatic compaction fits an overlong summary from the summary alone, shortenedFits=${shortenedFits}`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-policy-fit-")), home = join(root, "home"), cwd = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(cwd, { mode: 0o700 });
+  const model = "fixture/compaction";
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  const assistant = Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("");
+  const rules = "Standing rules and constraints:\n- Keep the release region at ap-south-9.\n";
+  const remaining = "Work remaining:\n- Continue the saved task.";
+  const overlong = rules + "Work done:\n" + "- repeated historical detail\n".repeat(2_000) + remaining;
+  // A rewrite that still misses the target must be trimmed, never regenerated from the source.
+  const shortened = rules + "Work done:\n" + (shortenedFits ? "- Read the historical references.\n" : "- still too much detail\n".repeat(1_500)) + remaining;
+  let phase = "seed";
+  const summaries: string[] = [], shortenings: string[] = [], bodies: string[] = [];
+  const gateway = startDynamicFakeGateway((body: string) => {
+    const request = JSON.parse(body);
+    bodies.push(body);
+    if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
+      const system = request.prompt.filter((message: { role: string }) => message.role === "system").map((message: { content: unknown }) => JSON.stringify(message.content)).join("\n");
+      const input = request.prompt.findLast((message: { role: string }) => message.role === "user").content[0].text;
+      if (system.includes("shortening task-continuation memory")) {
+        shortenings.push(input);
+        return fakeGatewayFinalText(shortened);
+      }
+      summaries.push(input);
+      return fakeGatewayFinalText(overlong);
+    }
+    return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
+  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-compaction-policy", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  async function ask(args: string[], label: string) {
+    const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
+    const child = Bun.spawn([binary, "ask", "--json", ...args], { cwd, env, stdin: "ignore", stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    try {
+      expect(await child.exited).toBe(0);
+      expect(readFileSync(stderr, "utf8")).toBe("");
+      return JSON.parse(readFileSync(stdout, "utf8"));
+    } finally { clearTimeout(timer); }
+  }
+  let passed = false;
+  try {
+    const seed = await ask(["Keep the release region at ap-south-9 for every deploy."], "seed");
+    phase = "continue";
+    const result = await ask(["--resume-id", seed.session_id, "Continue the saved task."], "continue");
+    expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
+    // The large source is summarized in chunks that split one target; one rewrite follows.
+    const chunks = summaries.length;
+    expect(chunks).toBeGreaterThan(0);
+    expect(shortenings).toHaveLength(1);
+    const chunkTargets = summaries.map(input => Number(/Use at most (\d+) tokens, spending that room/.exec(input)?.[1]));
+    const shortening = shortenings[0]!;
+    expect(shortening.startsWith("DERIVED_MEMORY_TO_SHORTEN")).toBe(true);
+    const target = Number(/Rewrite this memory to at most (\d+) tokens/.exec(shortening)?.[1]);
+    for (const chunkTarget of chunkTargets) expect(chunkTarget).toBe(Math.floor(target / chunks));
+    expect(shortening).toContain(overlong);
+    expect(shortening).not.toContain("Assistant reference");
+    expect(shortening).not.toContain("USER_RETAINED:");
+    expect(shortening.length).toBeLessThan(chunks * (overlong.length + 2) + 512);
+    const sessionDir = join(home, ".fx/sessions", seed.session_id);
+    const rows = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const checkpoints = rows.filter(row => row.event?.context_checkpoint);
+    expect(checkpoints.length).toBe(1);
+    const handoff: string = checkpoints[0].event.context_checkpoint.summary;
+    const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
+    const state = JSON.parse(readFileSync(join(sessionDir, "tool-results", match![1]!)).toString());
+    if (shortenedFits) {
+      expect(state.summary).toBe(shortened);
+    } else {
+      expect(state.summary.startsWith(rules + "Work done:\n")).toBe(true);
+      expect(state.summary).toMatch(/\n\[trimmed \d+ lines here to fit the handoff budget\]\n/);
+      expect(state.summary.endsWith(remaining)).toBe(true);
+    }
+    expect(bodies.at(-1)).toContain("Keep the release region at ap-south-9.");
+    passed = true;
+  } finally {
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else { writeFileSync(join(root, "requests.json"), JSON.stringify(bodies, null, 2)); console.error(`compaction evidence retained: ${root}`); }
+  }
+}, 90_000);
