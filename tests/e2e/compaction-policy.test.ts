@@ -31,6 +31,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
       const source = sourceMessages[0].content[0].text;
       expect(source).toContain("\n\nEND OF HISTORICAL TRANSCRIPT.\nProduce the completed task-continuation memory now.");
       expect(source.endsWith("Return the memory itself, not a promise to write it.\n")).toBe(true);
+      expect(source).toMatch(/Use at most \d+ tokens, spending that room on still-relevant detail\. /);
       fallback ||= source.includes("USER_TO_SUMMARIZE:");
       expect(request.maxOutputTokens).toBe(8192);
       const facts = [];
@@ -83,6 +84,15 @@ for (const userHeavy of [false, true]) test(`automatic compaction preserves task
     expect(bytes.length).toBe(Number(match![2])); expect(digest(bytes)).toBe(match![3]);
     const state = JSON.parse(bytes.toString());
     expect(state.users.includes(originalUser)).toBe(!userHeavy);
+    // An oversized user message becomes a placeholder whose saved original reads back exactly.
+    const stubs: { artifact: { handle: string; bytes: number; sha256: string } }[] = state.stubs ?? [];
+    expect(stubs).toHaveLength(userHeavy ? 1 : 0);
+    for (const stub of stubs) {
+      const saved = readFileSync(join(sessionDir, "tool-results", stub.artifact.handle));
+      expect(saved.length).toBe(stub.artifact.bytes); expect(digest(saved)).toBe(stub.artifact.sha256);
+      expect(saved.toString()).toBe(originalUser);
+      expect(handoff).toContain(`full text saved as ${stub.artifact.handle}; key facts are in the summary]`);
+    }
     expect(state.summary).toContain("verified value is73");
     expect(state.summary).toContain("transport-resume");
     for (const archive of state.archives) {
