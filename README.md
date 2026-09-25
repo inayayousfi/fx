@@ -93,6 +93,10 @@ FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 fx
 
 Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
 
+## TUI status line
+
+The status line shows the last reported input token count for the current conversation beside the model. After compaction it drops to an estimate of the summary and retained turns, then updates when the next model response reports usage. Use `/statusline` to turn the context display off or back on.
+
 ## Themes
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
