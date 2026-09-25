@@ -5288,6 +5288,7 @@ pub fn Runtime(comptime App: type) type {
             app.session.commitCompactedHistory(app.alloc, prepared);
             prepared_owned = false;
             if (comptime @hasField(App, "context_input_tokens")) app.context_input_tokens = context_tokens;
+            if (comptime @hasField(App, "context_output_baseline")) app.context_output_baseline = app.stream.token_progress.output_tokens;
         }
 
         pub fn commitPermissionState(

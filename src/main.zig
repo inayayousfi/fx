@@ -585,8 +585,9 @@ const App = struct {
     next_diff_id: u32 = 1,
 
     statusline_context: bool = true,
-    /// Latest measured input size of the active conversation, not lifetime usage.
+    /// Context estimate at the latest request or usage boundary, not lifetime usage.
     context_input_tokens: ?u64 = null,
+    context_output_baseline: u64 = 0,
     statusline_session: bool = false,
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.

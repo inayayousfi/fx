@@ -95,7 +95,7 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 ## TUI status line
 
-The status line shows the last reported input token count for the current conversation beside the model. After compaction it drops to an estimate of the summary and retained turns, then updates when the next model response reports usage. Use `/statusline` to turn the context display off or back on.
+The status line shows an approximate current-context token count beside the model. It updates as responses stream, drops to an estimate of the summary and retained turns after compaction, and reconciles with reported usage. Use `/statusline` to turn the display off or back on.
 
 ## Themes
 
